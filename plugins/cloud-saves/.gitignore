@@ -1,0 +1,4 @@
+# 插件运行时生成的本地文件，切勿提交到仓库（config.json 含 GitHub 令牌）
+node_modules/
+config.json
+config.json.tmp

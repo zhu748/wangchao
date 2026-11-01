@@ -3,6 +3,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // 全局变量
     let isAuthorized = false;
     let currentSaves = [];
+    let currentLoadedTag = null; // 当前加载的存档标签（由 /status 刷新）
     let confirmCallback = null;
     let renameTarget = null;
     let initialConfigHasToken = false; // 新增：用于跟踪初始加载时是否有token
@@ -19,6 +20,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const authorizeBtn = document.getElementById('authorize-btn');
     const logoutBtn = document.getElementById('logout-btn');
     const initRepoBtn = document.getElementById('init-repo-btn'); // 新增
+    const clearTokenBtn = document.getElementById('clear-token-btn'); // 清除已保存令牌
 
     const createSaveSection = document.getElementById('create-save-section');
     const saveNameInput = document.getElementById('save-name');
@@ -68,6 +70,33 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // 新增：检查更新按钮
     const checkUpdateBtn = document.getElementById('check-update-btn');
+
+    // HTML 转义：所有来自后端/远程仓库的动态字符串插入 DOM 前必须转义，
+    // 防止恶意存档名/描述/操作人在插件页面内注入脚本
+    function esc(value) {
+        return String(value === null || value === undefined ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // 从标签名解码存档名（标签名格式为 save_<时间戳>_<base64url(名称)>）
+    function decodeSaveName(tag) {
+        const match = String(tag || '').match(/^save_\d+_(.+)$/);
+        if (!match) return String(tag || '');
+        try {
+            let b64 = match[1].replace(/-/g, '+').replace(/_/g, '/');
+            while (b64.length % 4 !== 0) b64 += '=';
+            const bytes = atob(b64);
+            const raw = new Uint8Array(bytes.length);
+            for (let i = 0; i < bytes.length; i++) raw[i] = bytes.charCodeAt(i);
+            return new TextDecoder('utf-8').decode(raw);
+        } catch (e) {
+            return match[1];
+        }
+    }
 
     // API调用工具函数
     async function apiCall(endpoint, method = 'GET', data = null) {
@@ -160,13 +189,13 @@ document.addEventListener('DOMContentLoaded', function() {
             toast.style.borderLeft = '4px solid var(--bs-primary)';
         }
         
-        // 设置内容
+        // 设置内容（title/message 可能包含后端/Git 输出，必须转义）
         toast.innerHTML = `
             <div class="toast-header">
-                <strong class="me-auto">${title}</strong>
+                <strong class="me-auto">${esc(title)}</strong>
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="toast" aria-label="Close"></button>
             </div>
-            <div class="toast-body">${message}</div>
+            <div class="toast-body">${esc(message)}</div>
         `;
         
         toastContainer.appendChild(toast);
@@ -210,7 +239,9 @@ document.addEventListener('DOMContentLoaded', function() {
             
             autoSaveEnabledSwitch.checked = config.autoSaveEnabled || false;
             autoSaveIntervalInput.value = config.autoSaveInterval || 30;
-            autoSaveTargetTagInput.value = config.autoSaveTargetTag || '';
+            // 目标存档为下拉框：先记录期望值，待存档列表加载后由 populateAutoSaveTargetOptions 应用
+            autoSaveTargetTagInput.dataset.pendingValue = config.autoSaveTargetTag || '';
+            populateAutoSaveTargetOptions();
             autoSaveOptionsDiv.style.display = autoSaveEnabledSwitch.checked ? 'flex' : 'none';
             
             isAuthorized = config.is_authorized;
@@ -282,14 +313,16 @@ document.addEventListener('DOMContentLoaded', function() {
             
             if (statusResult.success && statusResult.status) {
                 const status = statusResult.status;
-                
-                // 更新Git初始化状态
-                if (status.initialized) {
+
+                // 更新Git初始化状态（含 detached HEAD 提示）
+                if (status.isDetached) {
+                    gitStatus.innerHTML = `<i class="bi bi-exclamation-triangle-fill text-warning me-2"></i>处于游离 HEAD（重新创建存档或加载其他存档即可恢复）`;
+                } else if (status.initialized) {
                     gitStatus.innerHTML = `<i class="bi bi-check-circle-fill text-success me-2"></i>Git仓库就绪`;
                 } else {
                     gitStatus.innerHTML = `<i class="bi bi-circle-fill text-secondary me-2"></i>Git仓库未初始化`;
                 }
-                
+
                 // 更新更改状态
                 if (status.changes && status.changes.length > 0) {
                     changesCount.textContent = status.changes.length;
@@ -297,16 +330,31 @@ document.addEventListener('DOMContentLoaded', function() {
                 } else {
                     changesStatus.style.display = 'none';
                 }
-                
+
                 // 更新当前存档状态
+                currentLoadedTag = status.currentSave ? status.currentSave.tag : null;
                 if (status.currentSave) {
-                    const saveNameMatch = status.currentSave.tag.match(/^save_\d+_(.+)$/);
-                    const saveName = saveNameMatch ? saveNameMatch[1] : status.currentSave.tag;
-                    currentSaveStatus.innerHTML = `当前存档: <strong>${saveName}</strong>`;
+                    currentSaveStatus.innerHTML = `当前存档: <strong>${esc(decodeSaveName(status.currentSave.tag))}</strong>`;
                 } else {
                     currentSaveStatus.textContent = '未加载任何存档';
                 }
-                
+
+                // 更新自动存档结果
+                const autosaveStatus = document.getElementById('autosave-status');
+                if (autosaveStatus) {
+                    if (status.lastAutoSave) {
+                        const savedAt = new Date(status.lastAutoSave.timestamp).toLocaleString();
+                        if (status.lastAutoSave.status === 'success') {
+                            autosaveStatus.innerHTML = `<i class="bi bi-clock-check text-success me-1"></i>自动存档成功: ${esc(savedAt)}`;
+                        } else {
+                            autosaveStatus.innerHTML = `<i class="bi bi-clock-x text-danger me-1"></i>自动存档失败: ${esc(savedAt)}`;
+                        }
+                        autosaveStatus.style.display = 'inline';
+                    } else {
+                        autosaveStatus.style.display = 'none';
+                    }
+                }
+
                 // 检查临时stash状态
                 if (status.tempStash && status.tempStash.exists) {
                     stashNotification.style.display = 'block';
@@ -329,8 +377,10 @@ document.addEventListener('DOMContentLoaded', function() {
             
             if (result.success && result.saves) {
                 currentSaves = result.saves;
-                
-                renderSavesList(currentSaves);
+
+                // 保留当前搜索/排序条件，并刷新“自动存档目标”下拉框选项
+                populateAutoSaveTargetOptions();
+                filterAndSortSaves();
             } else {
                 throw new Error(result.message || '获取存档列表失败');
             }
@@ -341,6 +391,31 @@ document.addEventListener('DOMContentLoaded', function() {
             console.error('加载存档列表失败:', error);
             showToast('错误', `加载存档列表失败: ${error.message}`, 'error');
         }
+    }
+
+    // 用最新存档列表填充“自动存档目标”下拉框（避免手输标签名出错）
+    function populateAutoSaveTargetOptions() {
+        if (!autoSaveTargetTagInput || autoSaveTargetTagInput.tagName !== 'SELECT') return;
+        const desired = autoSaveTargetTagInput.dataset.pendingValue || autoSaveTargetTagInput.value || '';
+        autoSaveTargetTagInput.innerHTML = '';
+
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = '-- 选择要自动覆盖的存档 --';
+        autoSaveTargetTagInput.appendChild(placeholder);
+
+        currentSaves.forEach(save => {
+            const option = document.createElement('option');
+            option.value = save.tag;
+            const updatedAt = new Date(save.updatedAt);
+            option.textContent = `${save.name}（${isNaN(updatedAt) ? '未知时间' : updatedAt.toLocaleString()}）`;
+            autoSaveTargetTagInput.appendChild(option);
+        });
+
+        if (desired && Array.from(autoSaveTargetTagInput.options).some(o => o.value === desired)) {
+            autoSaveTargetTagInput.value = desired;
+        }
+        delete autoSaveTargetTagInput.dataset.pendingValue;
     }
 
     // 渲染存档列表
@@ -356,73 +431,59 @@ document.addEventListener('DOMContentLoaded', function() {
             return;
         }
         
-        // 获取当前加载的存档
-        let currentLoadedSave = null;
-        
-        apiCall('config').then(config => {
-            if (config.current_save && config.current_save.tag) {
-                currentLoadedSave = config.current_save.tag;
-                
-                // 更新已渲染的存档卡片
-                const currentSaveCard = document.querySelector(`.save-card[data-tag="${currentLoadedSave}"]`);
-                if (currentSaveCard) {
-                    const badge = document.createElement('div');
-                    badge.classList.add('save-current-badge');
-                    badge.textContent = '当前存档';
-                    currentSaveCard.appendChild(badge);
-                }
-            }
-        });
-        
-        // 创建存档卡片
+        // 获取当前加载的存档（由 refreshStatus 维护，避免每次渲染都额外请求 /config）
+        const currentLoaded = currentLoadedTag;
+
+        // 创建存档卡片（所有动态字段经 esc() 转义，防止来自远程仓库的内容注入 HTML/属性）
         saves.forEach(save => {
             const saveCard = document.createElement('div');
             saveCard.classList.add('card', 'save-card', 'mb-3');
             saveCard.dataset.tag = save.tag;
-            
-            const saveDate = new Date(save.timestamp);
-            const formattedDate = saveDate.toLocaleString();
-            
-            // 使用新的时间戳字段
+
             const createdAtDate = new Date(save.createdAt);
             const updatedAtDate = new Date(save.updatedAt);
-            const formattedCreatedAt = createdAtDate.toLocaleString();
-            const formattedUpdatedAt = updatedAtDate.toLocaleString();
+            const formattedCreatedAt = isNaN(createdAtDate) ? '未知' : createdAtDate.toLocaleString();
+            const formattedUpdatedAt = isNaN(updatedAtDate) ? '未知' : updatedAtDate.toLocaleString();
             const descriptionText = save.description || '无描述';
             const creatorName = save.creator || '未知';
-            
+
+            const safeName = esc(save.name);
+            const safeTag = esc(save.tag);
+            const safeDescription = esc(descriptionText);
+            const safeCreator = esc(creatorName);
+
             saveCard.innerHTML = `
                 <div class="card-body">
                     <div class="d-flex justify-content-between align-items-start">
                         <div style="flex-grow: 1; margin-right: 15px;">
-                            <h5 class="card-title mb-1">${save.name}</h5>
+                            <h5 class="card-title mb-1">${safeName}</h5>
                             <div class="save-timestamp mb-1">
                                 <small>创建于: ${formattedCreatedAt} | 更新于: ${formattedUpdatedAt}</small>
                             </div>
-                            <div class="save-creator mb-2">操作人: ${creatorName}</div>
-                            <div class="save-description">${descriptionText}</div>
-                            <!-- 新增：显示并可复制标签名 -->
+                            <div class="save-creator mb-2">操作人: ${safeCreator}</div>
+                            <div class="save-description">${safeDescription}</div>
+                            <!-- 显示并可复制标签名 -->
                             <div class="save-tag-info mt-2">
-                                <small class="text-muted">标签名: <code class="user-select-all">${save.tag}</code></small>
-                                <button class="btn btn-sm btn-outline-secondary copy-tag-btn ms-1" data-tag="${save.tag}" title="复制标签名">
+                                <small class="text-muted">标签名: <code class="user-select-all">${safeTag}</code></small>
+                                <button class="btn btn-sm btn-outline-secondary copy-tag-btn ms-1" data-tag="${safeTag}" title="复制标签名">
                                     <i class="bi bi-clipboard"></i>
                                 </button>
                             </div>
                         </div>
                         <div class="action-buttons flex-shrink-0">
-                            <button class="btn btn-sm btn-primary rename-save-btn" data-tag="${save.tag}" data-name="${save.name}" data-description="${descriptionText}" title="重命名此存档">
+                            <button class="btn btn-sm btn-primary rename-save-btn" data-tag="${safeTag}" data-name="${safeName}" data-description="${safeDescription}" title="重命名此存档">
                                 <i class="bi bi-pencil"></i>
                             </button>
-                            <button class="btn btn-sm btn-success load-save-btn" data-tag="${save.tag}" title="加载此存档">
+                            <button class="btn btn-sm btn-success load-save-btn" data-tag="${safeTag}" title="加载此存档">
                                 <i class="bi bi-cloud-download"></i>
                             </button>
-                            <button class="btn btn-sm btn-warning overwrite-save-btn" data-tag="${save.tag}" data-name="${save.name}" title="用当前本地数据覆盖此云存档">
+                            <button class="btn btn-sm btn-warning overwrite-save-btn" data-tag="${safeTag}" data-name="${safeName}" title="用当前本地数据覆盖此云存档">
                                 <i class="bi bi-upload"></i>
                             </button>
-                            <button class="btn btn-sm btn-outline-info diff-save-btn" data-tag="${save.tag}" data-name="${save.name}" title="比较差异">
+                            <button class="btn btn-sm btn-outline-info diff-save-btn" data-tag="${safeTag}" data-name="${safeName}" title="比较差异">
                                 <i class="bi bi-file-diff"></i>
                             </button>
-                            <button class="btn btn-sm btn-danger delete-save-btn" data-tag="${save.tag}" title="删除此存档">
+                            <button class="btn btn-sm btn-danger delete-save-btn" data-tag="${safeTag}" title="删除此存档">
                                 <i class="bi bi-trash"></i>
                             </button>
                         </div>
@@ -431,7 +492,7 @@ document.addEventListener('DOMContentLoaded', function() {
             `;
             
             // 如果是当前加载的存档，添加标记
-            if (save.tag === currentLoadedSave) {
+            if (currentLoaded && save.tag === currentLoaded) {
                 const badge = document.createElement('div');
                 badge.classList.add('save-current-badge');
                 badge.textContent = '当前存档';
@@ -550,7 +611,7 @@ document.addEventListener('DOMContentLoaded', function() {
                                     case 'C': statusText = '复制'; statusClass = 'text-info'; statusIcon = '<i class="bi bi-files me-2"></i>'; break;
                                     default: statusText = file.status; statusClass = 'text-secondary'; statusIcon = '<i class="bi bi-question-circle-fill me-2"></i>';
                                 }
-                                li.innerHTML = `<span class="${statusClass}" style="display: inline-block; width: 60px;">${statusIcon}${statusText}</span><code>${file.fileName}</code>`;
+                                li.innerHTML = `<span class="${statusClass}" style="display: inline-block; width: 60px;">${statusIcon}${statusText}</span><code>${esc(file.fileName)}</code>`;
                                 fileList.appendChild(li);
                             });
                             diffFiles.appendChild(fileList);
@@ -619,7 +680,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // --- 新增：高亮当前存档的辅助函数 ---
     function highlightCurrentSave(tagName) {
         document.querySelectorAll('.save-current-badge').forEach(badge => badge.remove());
-        const saveCard = document.querySelector(`.save-card[data-tag="${tagName}"]`);
+        const saveCard = document.querySelector(`.save-card[data-tag="${CSS.escape(tagName)}"]`);
         if (saveCard) {
             const badge = document.createElement('div');
             badge.classList.add('save-current-badge');
@@ -645,7 +706,11 @@ document.addEventListener('DOMContentLoaded', function() {
                 
                 // 从列表移除
                 currentSaves = currentSaves.filter(save => save.tag !== tagName);
-                renderSavesList(currentSaves);
+                if (currentLoadedTag === tagName) {
+                    currentLoadedTag = null;
+                }
+                populateAutoSaveTargetOptions();
+                filterAndSortSaves();
                 
                 // 刷新状态
                 await refreshStatus();
@@ -770,6 +835,27 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    // 清除后端保存的 GitHub 令牌
+    async function clearSavedToken() {
+        try {
+            showLoading('正在清除令牌...');
+            const result = await apiCall('config', 'POST', { clear_token: true });
+            if (result.success) {
+                initialConfigHasToken = false;
+                githubTokenInput.value = '';
+                githubTokenInput.placeholder = '例如: ghp_xxxxxxxxxxxx';
+                showToast('成功', '已清除本地保存的访问令牌', 'success');
+            } else {
+                throw new Error(result.message || '清除令牌失败');
+            }
+            hideLoading();
+        } catch (error) {
+            hideLoading();
+            console.error('清除令牌失败:', error);
+            showToast('错误', `清除令牌失败: ${error.message}`, 'error');
+        }
+    }
+
     // 登出/断开连接 (MODIFIED - Explicitly reset flag)
     async function logout() {
         try {
@@ -787,7 +873,7 @@ document.addEventListener('DOMContentLoaded', function() {
             // githubTokenInput.value = ''; // updateAuthUI handles this via the !initialConfigHasToken check
 
             hideLoading();
-            showToast('成功', '已断开与仓库的连接', 'success');
+            showToast('成功', '已断开与仓库的连接（已保存的访问令牌仍保留在本机，可点击令牌输入框旁的"清除"按钮删除）', 'success');
         } catch (error) {
             hideLoading();
             console.error('断开连接失败:', error);
@@ -871,7 +957,10 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // 过滤和排序存档列表
     function filterAndSortSaves() {
-        if (!currentSaves || currentSaves.length === 0) return;
+        if (!currentSaves || currentSaves.length === 0) {
+            renderSavesList([]);
+            return;
+        }
         
         const searchTerm = searchBox.value.toLowerCase();
         const sortMethod = sortSelector.value;
@@ -971,7 +1060,7 @@ document.addEventListener('DOMContentLoaded', function() {
             // 调用 /config 接口保存所有配置 (后端会根据新配置重启定时器)
             const result = await apiCall('config', 'POST', {
                 repo_url: repoUrlInput.value.trim(),
-                github_token: githubTokenInput.value.trim(), // 注意：这里如果为空或******，可能导致token被清空
+                github_token: githubTokenInput.value.trim(), // 为空时后端会保留已有令牌，不会清空
                 display_name: displayNameInput.value.trim(),
                 branch: branchInput.value.trim() || 'main',
                 autoSaveEnabled: enabled,
@@ -1062,29 +1151,32 @@ document.addEventListener('DOMContentLoaded', function() {
             showToast('错误', '仓库 URL 不能为空', 'error');
             return;
         }
-        // 检查1: 如果用户 *输入了新* token
-        if (tokenInputValue && tokenInputValue !== "") {
-            showToast('提示', '检测到新的访问令牌输入，请先点击"配置"按钮保存新令牌，然后再点击"授权并连接"。', 'info');
-            return; // 阻止直接授权
+        // 检查: 若输入了新令牌则先自动保存配置（免去"先点配置再点授权"两步操作）
+        if (tokenInputValue) {
+            const saved = await saveConfiguration();
+            if (!saved) return;
         }
-        // 检查2: 如果用户 *没输入新* token，且 *后台原本就没* token
+        // 检查: 没输入新令牌且后台也没有令牌
         if (!tokenInputValue && !initialConfigHasToken) {
-            showToast('错误', 'GitHub 访问令牌不能为空，请在上方输入或点击"配置"保存。', 'error');
+            showToast('错误', 'GitHub 访问令牌不能为空，请在上方输入后点击"授权并连接"。', 'error');
             return;
         }
 
-        // 如果执行到这里，说明：
-        // - URL 已输入
-        // - 要么输入框为空且后台有 token (initialConfigHasToken is true) -> 使用后台 token
-        // (已经排除了"输入框为空且后台没token" 和 "输入框有新token" 的情况)
-
-        // 执行授权 (不再传递 tokenInputValue)
+        // 执行授权（后端从已保存的配置读取令牌）
         await authorize(repoUrl, displayName, branch);
 
     }, 'authorize-btn');
     safeAddEventListener(logoutBtn, 'click', () => {
         showConfirmDialog('确认断开连接', '您确定要断开与仓库的连接吗？这将不会删除任何数据。', logout, 'primary');
     }, 'logout-btn');
+    safeAddEventListener(clearTokenBtn, 'click', () => {
+        showConfirmDialog(
+            '确认清除令牌',
+            '将从本机配置文件中删除已保存的 GitHub 访问令牌。清除后需要重新输入令牌才能再次连接仓库。',
+            clearSavedToken,
+            'primary'
+        );
+    }, 'clear-token-btn');
     safeAddEventListener(createSaveBtn, 'click', () => {
         createSave(saveNameInput.value, saveDescriptionInput.value);
     }, 'create-save-btn');
@@ -1099,7 +1191,11 @@ document.addEventListener('DOMContentLoaded', function() {
         confirmModal.hide();
     }, 'confirm-action-btn');
     safeAddEventListener(refreshSavesBtn, 'click', loadSavesList, 'refresh-saves-btn');
-    safeAddEventListener(searchBox, 'input', filterAndSortSaves, 'search-box');
+    let searchDebounceTimer = null;
+    safeAddEventListener(searchBox, 'input', () => {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(filterAndSortSaves, 250);
+    }, 'search-box');
     safeAddEventListener(sortSelector, 'change', filterAndSortSaves, 'sort-selector');
     safeAddEventListener(applyStashBtn, 'click', applyStash, 'apply-stash-btn');
     safeAddEventListener(discardStashBtn, 'click', () => {

@@ -249,10 +249,15 @@
 
                     <div class="mb-3">
                         <label for="github-token" class="form-label">GitHub 访问令牌</label>
-                        <input type="password" class="form-control" id="github-token" placeholder="例如: ghp_xxxxxxxxxxxx">
+                        <div class="input-group">
+                            <input type="password" class="form-control" id="github-token" placeholder="例如: ghp_xxxxxxxxxxxx" autocomplete="off">
+                            <button class="btn btn-outline-secondary" id="clear-token-btn" type="button" title="从本机配置中删除已保存的令牌">
+                                <i class="bi bi-eraser me-1"></i>清除
+                            </button>
+                        </div>
                         <div class="form-text text-light">
                             <a href="https://github.com/settings/tokens" target="_blank" class="text-info">创建令牌</a>
-                            需要具有 repo 权限
+                            需要具有 repo 权限；令牌仅保存在本机 config.json 中
                         </div>
                     </div>
                     <div class="mb-3">
@@ -295,9 +300,11 @@
                         <input type="number" class="form-control" id="auto-save-interval" min="1" value="30">
                     </div>
                     <div class="col-md-6">
-                        <label for="auto-save-target-tag" class="form-label">覆盖的目标存档标签</label>
-                        <input type="text" class="form-control" id="auto-save-target-tag" placeholder="输入要覆盖的存档标签名">
-                        <small class="form-text text-muted">必须是已存在的云存档标签名。每次自动存档将覆盖此存档。</small>
+                        <label for="auto-save-target-tag" class="form-label">覆盖的目标存档</label>
+                        <select class="form-select" id="auto-save-target-tag">
+                            <option value="">-- 选择要自动覆盖的存档 --</option>
+                        </select>
+                        <small class="form-text text-muted">每次自动存档会用当前数据覆盖所选存档（标签）。</small>
                     </div>
                 </div>
                  <button id="save-auto-save-settings-btn" class="btn btn-sm btn-secondary mt-3">保存定时设置</button>
@@ -312,7 +319,7 @@
             <div class="card-body">
                 <div class="row g-3">
                     <div class="col-md-6">
-                        <input type="text" class="form-control" id="save-name" placeholder="存档名称（必填）">
+                        <input type="text" class="form-control" id="save-name" placeholder="存档名称（必填，最多 100 字符）" maxlength="100">
                     </div>
                     <div class="col-md-6">
                         <div class="d-grid">
@@ -377,6 +384,7 @@
                     <span id="changes-status" class="ms-3" style="display: none;">
                         <i class="bi bi-pencil-fill text-warning me-1"></i><span id="changes-count">0</span> 个未保存的更改
                     </span>
+                    <span id="autosave-status" class="ms-3" style="display: none;"></span>
                 </div>
                 <div>
                     <span id="current-save-status">未加载任何存档</span>
